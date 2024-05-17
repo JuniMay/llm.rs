@@ -23,7 +23,7 @@ const T: usize = 64;
 const GEN_T: usize = 64;
 
 fn main() -> io::Result<()> {
-    let mut gpt2 = Gpt2::from_ckpt("ckpts/gpt2_124M.bin", B, T);
+    let mut gpt2 = Gpt2::from_ckpt("gpt2_124M.bin", B, T);
     let mut train_loader = DataLoader::new(TRAIN_DATA, B, T);
     let mut valid_loader = DataLoader::new(VALID_DATA, B, T);
 
@@ -32,7 +32,7 @@ fn main() -> io::Result<()> {
     dbg!(gpt2.acts.num_parameters());
 
     let mut tokenizer = Tokenizer::default();
-    tokenizer.init("ckpts/gpt2_tokenizer.bin")?;
+    tokenizer.init("gpt2_tokenizer.bin")?;
 
     let val_num_batches = 5;
 
