@@ -408,18 +408,8 @@ pub fn layernorm_forward(
     for b in 0..B {
         for t in 0..T {
             let x = &inp[b * T * C + t * C..b * T * C + (t + 1) * C];
-            let mut m = 0.0f32;
-            for i in 0..C {
-                m += x[i];
-            }
-            m /= C as f32;
-
-            let mut v = 0.0f32;
-            for i in 0..C {
-                let xshift = x[i] - m;
-                v += xshift * xshift;
-            }
-            v /= C as f32;
+            let m = x.iter().take(C).sum::<f32>() / C as f32;
+            let v = x.iter().take(C).map(|xi| (xi - m) * (xi - m)).sum::<f32>() / C as f32;
 
             let s = 1.0f32 / (v + eps).sqrt();
 
@@ -651,21 +641,20 @@ pub fn attention_forward(
                 }
                 let expsum_inv = if expsum == 0.0 { 0.0 } else { 1.0 / expsum };
 
-                // pass 3: normalize to get the softmax
-                for t2 in 0..T {
-                    if t2 <= t {
-                        att_bth[t2] *= expsum_inv;
-                    } else {
-                        att_bth[t2] = 0.0;
-                    }
-                }
+                att_bth
+                    .iter_mut()
+                    .take(t + 1)
+                    .for_each(|x| *x *= expsum_inv);
+                att_bth
+                    .iter_mut()
+                    .take(T)
+                    .skip(t + 1)
+                    .for_each(|x| *x = 0.0);
 
                 // pass 4: accumulate weighted values into the output of attention
                 let out_bth =
                     &mut out[b * T * C + t * C + h * hs..b * T * C + t * C + (h + 1) * hs];
-                for i in 0..hs {
-                    out_bth[i] = 0.0;
-                }
+                out_bth.iter_mut().for_each(|x| *x = 0.0);
                 for t2 in 0..=t {
                     let value_t2 = &inp[b * T * C3 + t2 * C3 + h * hs + 2 * C
                         ..b * T * C3 + t2 * C3 + h * hs + 2 * C + hs];
@@ -805,26 +794,14 @@ pub fn softmax_forward(probs: &mut [f32], logits: &[f32], B: usize, T: usize, V:
             let logits_bt = &logits[b * T * Vp + t * Vp..b * T * Vp + (t + 1) * Vp];
             let probs_bt = &mut probs[b * T * Vp + t * Vp..b * T * Vp + (t + 1) * Vp];
 
-            // maxval is only calculated and subtracted for numerical stability
-            let mut maxval = -10000.0f32; // just like in llm.c
-            for i in 0..V {
-                if logits_bt[i] > maxval {
-                    maxval = logits_bt[i];
-                }
-            }
+            let maxval = logits_bt.iter().take(V).fold(-10000.0f32, |a, b| a.max(*b));
             let mut sum = 0.0f32;
             for i in 0..V {
                 probs_bt[i] = (logits_bt[i] - maxval).exp();
                 sum += probs_bt[i];
             }
-            // normalize to get probabilities
-            for i in 0..V {
-                probs_bt[i] /= sum;
-            }
-            // setting padded dimensions to zero
-            for i in V..Vp {
-                probs_bt[i] = 0.0;
-            }
+            probs_bt.iter_mut().take(V).for_each(|x| *x /= sum);
+            probs_bt.iter_mut().take(Vp).skip(V).for_each(|x| *x = 0.0);
         }
     }
 }

@@ -37,8 +37,8 @@ impl Tokenizer {
         let mut reader = BufReader::new(file);
 
         let mut header = [0u32; 256];
-        for i in 0..256 {
-            header[i] = Self::read_u32(&mut reader)?;
+        for header_i in header.iter_mut() {
+            *header_i = Self::read_u32(&mut reader)?;
         }
         assert_eq!(header[0], 20240328);
         let version = header[1];

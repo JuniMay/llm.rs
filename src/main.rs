@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 #![allow(non_snake_case)]
 #![allow(clippy::too_many_arguments)]
-#![allow(clippy::needless_range_loop)]
 
 use std::{
     io::{self, Write},
