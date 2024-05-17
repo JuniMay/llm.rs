@@ -341,18 +341,25 @@ pub fn encoder_forward(
     T: usize,
     C: usize,
 ) {
-    for b in 0..B {
-        for t in 0..T {
-            let out_bt = &mut out[b * T * C + t * C..b * T * C + (t + 1) * C];
-            let ix = inp[b * T + t] as usize;
-            let wte_ix = &wte[ix * C..(ix + 1) * C];
-            let wpe_t = &wpe[t * C..(t + 1) * C];
-
-            for i in 0..C {
-                out_bt[i] = wte_ix[i] + wpe_t[i];
-            }
-        }
-    }
+    out.chunks_exact_mut(T * C)
+        .zip(inp.chunks_exact(T))
+        .take(B)
+        .for_each(|(out_b, inp_b)| {
+            out_b
+                .chunks_exact_mut(C)
+                .zip(inp_b.iter())
+                .zip(wpe.chunks_exact(C))
+                .take(T)
+                .for_each(|((out_bt, &ix), wpe_t)| {
+                    let wte_ix = &wte[ix as usize * C..(ix as usize + 1) * C];
+                    out_bt
+                        .iter_mut()
+                        .zip(wte_ix.iter().zip(wpe_t.iter()))
+                        .for_each(|(out_bti, (&wte_ixi, &wpe_ti))| {
+                            *out_bti = wte_ixi + wpe_ti;
+                        });
+                });
+        });
 }
 
 pub fn encoder_backward(
@@ -364,20 +371,26 @@ pub fn encoder_backward(
     T: usize,
     C: usize,
 ) {
-    for b in 0..B {
-        for t in 0..T {
-            let dout_bt = &dout[b * T * C + t * C..b * T * C + (t + 1) * C];
-            let ix = inp[b * T + t] as usize;
-            let dwte_ix = &mut dwte[ix * C..(ix + 1) * C];
-            let dwpe_t = &mut dwpe[t * C..(t + 1) * C];
-
-            for i in 0..C {
-                let d = dout_bt[i];
-                dwte_ix[i] += d;
-                dwpe_t[i] += d;
-            }
-        }
-    }
+    dout.chunks_exact(T * C)
+        .zip(inp.chunks_exact(T))
+        .take(B)
+        .for_each(|(dout_b, inp_b)| {
+            dout_b
+                .chunks_exact(C)
+                .zip(inp_b.iter())
+                .zip(dwpe.chunks_exact_mut(C))
+                .take(T)
+                .for_each(|((dout_bt, &ix), dwpe_t)| {
+                    let dwte_ix = &mut dwte[ix as usize * C..(ix as usize + 1) * C];
+                    dout_bt
+                        .iter()
+                        .zip(dwte_ix.iter_mut().zip(dwpe_t.iter_mut()))
+                        .for_each(|(dout_bti, (dwte_ixi, dwpe_ti))| {
+                            *dwte_ixi += dout_bti;
+                            *dwpe_ti += dout_bti;
+                        });
+                });
+        });
 }
 
 pub fn layernorm_forward(
@@ -740,39 +753,50 @@ pub fn attention_backward(
 
 pub fn gelu_forward(out: &mut [f32], inp: &[f32], N: usize) {
     let GELU_SCALING_FACTOR: f32 = (2.0 / PI).sqrt();
-    for i in 0..N {
-        let x = inp[i];
-        let cube = 0.044715 * x * x * x;
-        out[i] = 0.5 * x * (1.0 + (GELU_SCALING_FACTOR * (x + cube)).tanh());
-    }
+    out.iter_mut()
+        .zip(inp.iter())
+        .take(N)
+        .for_each(|(out_i, &inp_i)| {
+            let x = inp_i;
+            let cube = 0.044715 * x * x * x;
+            *out_i = 0.5 * x * (1.0 + (GELU_SCALING_FACTOR * (x + cube)).tanh());
+        });
 }
 
 pub fn gelu_backward(dinp: &mut [f32], inp: &[f32], dout: &[f32], N: usize) {
     let GELU_SCALING_FACTOR: f32 = (2.0 / PI).sqrt();
-    for i in 0..N {
-        let x = inp[i];
-        let cube = 0.044715 * x * x * x;
-        let tanh_arg = GELU_SCALING_FACTOR * (x + cube);
-        let tanh_out = tanh_arg.tanh();
-        let coshf_out = tanh_arg.cosh();
-        let sech_out = 1.0 / (coshf_out * coshf_out);
-        let local_grad = 0.5 * (1.0 + tanh_out)
-            + x * 0.5 * sech_out * GELU_SCALING_FACTOR * (1.0 + 3.0 * 0.044715 * x * x);
-        dinp[i] += local_grad * dout[i];
-    }
+    dinp.iter_mut()
+        .zip(inp.iter().zip(dout.iter()))
+        .take(N)
+        .for_each(|(dinp_i, (x, dout_i))| {
+            let cube = 0.044715 * x * x * x;
+            let tanh_arg = GELU_SCALING_FACTOR * (x + cube);
+            let tanh_out = tanh_arg.tanh();
+            let coshf_out = tanh_arg.cosh();
+            let sech_out = 1.0 / (coshf_out * coshf_out);
+            let local_grad = 0.5 * (1.0 + tanh_out)
+                + x * 0.5 * sech_out * GELU_SCALING_FACTOR * (1.0 + 3.0 * 0.044715 * x * x);
+            *dinp_i += local_grad * dout_i;
+        });
 }
 
 pub fn residual_forward(out: &mut [f32], inp1: &[f32], inp2: &[f32], N: usize) {
-    for i in 0..N {
-        out[i] = inp1[i] + inp2[i];
-    }
+    out.iter_mut()
+        .zip(inp1.iter().zip(inp2.iter()))
+        .take(N)
+        .for_each(|(out_i, (&inp1_i, &inp2_i))| {
+            *out_i = inp1_i + inp2_i;
+        });
 }
 
 pub fn residual_backward(dinp1: &mut [f32], dinp2: &mut [f32], dout: &[f32], N: usize) {
-    for i in 0..N {
-        dinp1[i] += dout[i];
-        dinp2[i] += dout[i];
-    }
+    dout.iter()
+        .zip(dinp1.iter_mut().zip(dinp2.iter_mut()))
+        .take(N)
+        .for_each(|(&dout_i, (dinp1_i, dinp2_i))| {
+            *dinp1_i += dout_i;
+            *dinp2_i += dout_i;
+        });
 }
 
 pub fn softmax_forward(probs: &mut [f32], logits: &[f32], B: usize, T: usize, V: usize, Vp: usize) {
