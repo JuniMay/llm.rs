@@ -5,7 +5,7 @@ Currently work in progress, some parts are very crappy.
 This is an attempt to migrate Karpathy's [llm.c](https://github.com/karpathy/llm.c) to safe rust.
 
 Most runtime costs of safe rust come from bounds checking, and for now, the performance of each
-training step of the rust version (opt-level=3) is about 300ms slower than the C version (in -O3).
+training step of the rust version (opt-level=3) is about 200ms slower than the C version (in -O3).
 
 I am working on improving the performance by using iterators and re-slicing tricks to avoid bounds
 checking.
@@ -43,7 +43,7 @@ Haven't figured out how to compile with any equivalent of `-Ofast` in rust yet.
 ## Benchmark
 
 No serious benchmarking has been done yet but the performance of the rust version is about 300ms
-slower than the C version for each training step on a MacBook M2 Max. Each step takes ~5s to finish.
+slower than the C version for each training step on a MacBook M2 Max. Each step takes ~4.7s to finish.
 
 ## Acknowledgments
 

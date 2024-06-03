@@ -532,25 +532,19 @@ pub fn matmul_forward(
     C: usize,
     OC: usize,
 ) {
-    for b in 0..B {
-        let out_b = &mut out[b * T * OC..b * T * OC + T * OC];
-        let inp_b = &inp[b * T * C..b * T * C + T * C];
-        // compute each row of the output
-        out_b
-            .par_chunks_mut(OC)
-            .zip(inp_b.par_chunks(C))
-            .take(T)
-            .for_each(|(row, inp_bt)| {
-                row.iter_mut().enumerate().for_each(|(o, val)| {
-                    let mut sum = if let Some(bias) = bias { bias[o] } else { 0.0 };
-                    let wrow = &weight[o * C..(o + 1) * C];
-                    for i in 0..C {
-                        sum += inp_bt[i] * wrow[i];
-                    }
-                    *val = sum;
-                });
+    out.par_chunks_mut(OC)
+        .zip(inp.par_chunks(C))
+        .take(B * T)
+        .for_each(|(out_bt, inp_bt)| {
+            out_bt.iter_mut().enumerate().for_each(|(o, val)| {
+                let mut sum = if let Some(bias) = bias { bias[o] } else { 0.0 };
+                let wrow = &weight[o * C..(o + 1) * C];
+                for i in 0..C {
+                    sum += inp_bt[i] * wrow[i];
+                }
+                *val = sum;
             })
-    }
+        })
 }
 
 pub fn matmul_backward(
@@ -565,23 +559,17 @@ pub fn matmul_backward(
     C: usize,
     OC: usize,
 ) {
-    // backward into inp first
-    for b in 0..B {
-        let dout_b = &dout[b * T * OC..b * T * OC + T * OC];
-        let dinp_b = &mut dinp[b * T * C..b * T * C + T * C];
-        dout_b
-            .par_chunks(OC)
-            .zip(dinp_b.par_chunks_mut(C))
-            .take(T)
-            .for_each(|(dout_bt, dinp_bt)| {
-                dout_bt.iter().enumerate().for_each(|(o, d)| {
-                    let wrow = &weight[o * C..(o + 1) * C];
-                    for i in 0..C {
-                        dinp_bt[i] += wrow[i] * d;
-                    }
-                });
+    dout.par_chunks(OC)
+        .zip(dinp.par_chunks_mut(C))
+        .take(B * T)
+        .for_each(|(dout_bt, dinp_bt)| {
+            dout_bt.iter().enumerate().for_each(|(o, d)| {
+                let wrow = &weight[o * C..(o + 1) * C];
+                for i in 0..C {
+                    dinp_bt[i] += wrow[i] * d;
+                }
             });
-    }
+        });
 
     if let Some(&mut ref mut dbias) = dbias {
         dweight
@@ -635,70 +623,71 @@ pub fn attention_forward(
     let C3 = C * 3;
     let hs = C / NH; // head size
     let scale = 1.0 / (hs as f32).sqrt();
-    // TODO: parallelize this
-    for b in 0..B {
-        for t in 0..T {
-            for h in 0..NH {
-                let query_t =
-                    &inp[b * T * C3 + t * C3 + h * hs..b * T * C3 + t * C3 + (h + 1) * hs];
-                let preatt_bth = &mut preatt
-                    [b * NH * T * T + h * T * T + t * T..b * NH * T * T + h * T * T + (t + 1) * T];
-                let att_bth = &mut att
-                    [b * NH * T * T + h * T * T + t * T..b * NH * T * T + h * T * T + (t + 1) * T];
+    // TODO: this is not the optimal method, the loop can be collapsed (as in llm.c)
+    preatt
+        .par_chunks_mut(NH * T * T)
+        .zip(att.par_chunks_mut(NH * T * T))
+        .zip(out.par_chunks_mut(T * C))
+        .zip(inp.par_chunks(T * C3))
+        .take(B)
+        .for_each(|(((preatt_b, att_b), out_b), inp_b)| {
+            for t in 0..T {
+                for h in 0..NH {
+                    let query_t = &inp_b[t * C3 + h * hs..t * C3 + (h + 1) * hs]; // hs * (B * T)
+                    let preatt_bth = &mut preatt_b[h * T * T + t * T..h * T * T + (t + 1) * T]; // T * (B * NH * T)
+                    let att_bth = &mut att_b[h * T * T + t * T..h * T * T + (t + 1) * T]; // T * (B * NH * T)
 
-                // pass 1: calculate query dot key and maxval
-                let mut maxval = -10000.0f32; // just like in llm.c
-                for t2 in 0..=t {
-                    let key_t2 = &inp
-                        [b * T * C3 + t2 * C3 + h * hs + C..b * T * C3 + t2 * C3 + h * hs + C + hs];
+                    // pass 1: calculate query dot key and maxval
+                    let mut maxval = -10000.0f32; // just like in llm.c
+                    for t2 in 0..=t {
+                        let key_t2 = &inp_b[t2 * C3 + h * hs + C..t2 * C3 + h * hs + C + hs];
 
-                    // (query_t) dot (key_t2)
-                    let mut val = 0.0f32;
-                    for i in 0..hs {
-                        val += query_t[i] * key_t2[i];
+                        // (query_t) dot (key_t2)
+                        let mut val = 0.0f32;
+                        for i in 0..hs {
+                            val += query_t[i] * key_t2[i];
+                        }
+                        val *= scale;
+                        if val > maxval {
+                            maxval = val;
+                        }
+
+                        preatt_bth[t2] = val;
                     }
-                    val *= scale;
-                    if val > maxval {
-                        maxval = val;
+
+                    // pass 2: calculate the exp and keep track of sum
+                    let mut expsum = 0.0f32;
+                    for t2 in 0..=t {
+                        let expv = (preatt_bth[t2] - maxval).exp();
+                        expsum += expv;
+                        att_bth[t2] = expv;
                     }
+                    let expsum_inv = if expsum == 0.0 { 0.0 } else { 1.0 / expsum };
 
-                    preatt_bth[t2] = val;
-                }
+                    att_bth
+                        .iter_mut()
+                        .take(t + 1)
+                        .for_each(|x| *x *= expsum_inv);
+                    att_bth
+                        .iter_mut()
+                        .take(T)
+                        .skip(t + 1)
+                        .for_each(|x| *x = 0.0);
 
-                // pass 2: calculate the exp and keep track of sum
-                let mut expsum = 0.0f32;
-                for t2 in 0..=t {
-                    let expv = (preatt_bth[t2] - maxval).exp();
-                    expsum += expv;
-                    att_bth[t2] = expv;
-                }
-                let expsum_inv = if expsum == 0.0 { 0.0 } else { 1.0 / expsum };
-
-                att_bth
-                    .iter_mut()
-                    .take(t + 1)
-                    .for_each(|x| *x *= expsum_inv);
-                att_bth
-                    .iter_mut()
-                    .take(T)
-                    .skip(t + 1)
-                    .for_each(|x| *x = 0.0);
-
-                // pass 4: accumulate weighted values into the output of attention
-                let out_bth =
-                    &mut out[b * T * C + t * C + h * hs..b * T * C + t * C + (h + 1) * hs];
-                out_bth.iter_mut().for_each(|x| *x = 0.0);
-                for t2 in 0..=t {
-                    let value_t2 = &inp[b * T * C3 + t2 * C3 + h * hs + 2 * C
-                        ..b * T * C3 + t2 * C3 + h * hs + 2 * C + hs];
-                    let att_btht2 = att_bth[t2];
-                    for i in 0..hs {
-                        out_bth[i] += att_btht2 * value_t2[i];
+                    // pass 4: accumulate weighted values into the output of attention
+                    let out_bth = &mut out_b[t * C + h * hs..t * C + (h + 1) * hs]; // C * (B * T)
+                    out_bth.iter_mut().for_each(|x| *x = 0.0);
+                    for t2 in 0..=t {
+                        let value_t2 =
+                            &inp_b[t2 * C3 + h * hs + 2 * C..t2 * C3 + h * hs + 2 * C + hs];
+                        let att_btht2 = att_bth[t2];
+                        for i in 0..hs {
+                            out_bth[i] += att_btht2 * value_t2[i];
+                        }
                     }
                 }
             }
-        }
-    }
+        })
 }
 
 pub fn attention_backward(
@@ -822,11 +811,11 @@ pub fn residual_backward(dinp1: &mut [f32], dinp2: &mut [f32], dout: &[f32], N: 
 }
 
 pub fn softmax_forward(probs: &mut [f32], logits: &[f32], B: usize, T: usize, V: usize, Vp: usize) {
-    for b in 0..B {
-        for t in 0..T {
-            let logits_bt = &logits[b * T * Vp + t * Vp..b * T * Vp + (t + 1) * Vp];
-            let probs_bt = &mut probs[b * T * Vp + t * Vp..b * T * Vp + (t + 1) * Vp];
-
+    logits
+        .par_chunks(Vp)
+        .zip(probs.par_chunks_mut(Vp))
+        .take(B * T)
+        .for_each(|(logits_bt, probs_bt)| {
             let maxval = logits_bt.iter().take(V).fold(-10000.0f32, |a, b| a.max(*b));
             let mut sum = 0.0f32;
             for i in 0..V {
@@ -835,8 +824,7 @@ pub fn softmax_forward(probs: &mut [f32], logits: &[f32], B: usize, T: usize, V:
             }
             probs_bt.iter_mut().take(V).for_each(|x| *x /= sum);
             probs_bt.iter_mut().take(Vp).skip(V).for_each(|x| *x = 0.0);
-        }
-    }
+        })
 }
 
 impl Gpt2 {
