@@ -38,7 +38,7 @@ fn main() -> io::Result<()> {
     let mut rng_state = 1337u64;
     let mut gen_tokens;
 
-    for step in 0..=1000 {
+    for step in 0..=40 {
         if step % 10 == 0 {
             let mut val_loss = 0.0f32;
             valid_loader.reset();

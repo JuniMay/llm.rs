@@ -5,8 +5,7 @@ Currently work in progress, some parts are very crappy.
 This is an attempt to migrate Karpathy's [llm.c](https://github.com/karpathy/llm.c) to safe rust.
 
 Most runtime costs of safe rust come from bounds checking, and for now, the performance of each
-training step of the rust version (opt-level=3) is about 500ms slower than the C version (in -O3,
-without openmp).
+training step of the rust version (opt-level=3) is about 300ms slower than the C version (in -O3).
 
 I am working on improving the performance by using iterators and re-slicing tricks to avoid bounds
 checking.
@@ -29,17 +28,22 @@ cargo build --release
 ./target/release/llm
 ```
 
-THIS WILL BE REALLY SLOW, there are no parallelism and only runs on CPU.
+The rayon is used for parallelism, currently only matmul is parallelized and the attention layer is
+not parallelized yet.
 
-To compare with the C version, change the optimization level in llm.c makefile to `-O3` and make
-with `NO_OMP=1 make train_gpt2`:
+To compare with the C version, change the optimization level in llm.c makefile to `-O3` and make.
 
 ```bash
-NO_OMP=1 make train_gpt2
-./train_gpt2
+make train_gpt2
+OMP_NUM_THREADS=12 ./train_gpt2
 ```
 
 Haven't figured out how to compile with any equivalent of `-Ofast` in rust yet.
+
+## Benchmark
+
+No serious benchmarking has been done yet but the performance of the rust version is about 300ms
+slower than the C version for each training step on a MacBook M2 Max. Each step takes ~5s to finish.
 
 ## Acknowledgments
 

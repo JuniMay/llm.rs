@@ -1,5 +1,10 @@
 use std::{f32::consts::PI, io::Read};
 
+use rayon::{
+    iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator},
+    slice::{ParallelSlice, ParallelSliceMut},
+};
+
 #[derive(Debug)]
 pub struct Gpt2Config {
     /// The number of layers in the model.
@@ -341,14 +346,14 @@ pub fn encoder_forward(
     T: usize,
     C: usize,
 ) {
-    out.chunks_exact_mut(T * C)
-        .zip(inp.chunks_exact(T))
+    out.chunks_mut(T * C)
+        .zip(inp.chunks(T))
         .take(B)
         .for_each(|(out_b, inp_b)| {
             out_b
-                .chunks_exact_mut(C)
+                .chunks_mut(C)
                 .zip(inp_b.iter())
-                .zip(wpe.chunks_exact(C))
+                .zip(wpe.chunks(C))
                 .take(T)
                 .for_each(|((out_bt, &ix), wpe_t)| {
                     let wte_ix = &wte[ix as usize * C..(ix as usize + 1) * C];
@@ -371,14 +376,14 @@ pub fn encoder_backward(
     T: usize,
     C: usize,
 ) {
-    dout.chunks_exact(T * C)
-        .zip(inp.chunks_exact(T))
+    dout.chunks(T * C)
+        .zip(inp.chunks(T))
         .take(B)
         .for_each(|(dout_b, inp_b)| {
             dout_b
-                .chunks_exact(C)
+                .chunks(C)
                 .zip(inp_b.iter())
-                .zip(dwpe.chunks_exact_mut(C))
+                .zip(dwpe.chunks_mut(C))
                 .take(T)
                 .for_each(|((dout_bt, &ix), dwpe_t)| {
                     let dwte_ix = &mut dwte[ix as usize * C..(ix as usize + 1) * C];
@@ -528,18 +533,23 @@ pub fn matmul_forward(
     OC: usize,
 ) {
     for b in 0..B {
-        for t in 0..T {
-            let out_bt = &mut out[b * T * OC + t * OC..b * T * OC + (t + 1) * OC];
-            let inp_bt = &inp[b * T * C + t * C..b * T * C + (t + 1) * C];
-            for o in 0..OC {
-                let mut val = if let Some(bias) = bias { bias[o] } else { 0.0 };
-                let wrow = &weight[o * C..(o + 1) * C];
-                for i in 0..C {
-                    val += inp_bt[i] * wrow[i];
-                }
-                out_bt[o] = val;
-            }
-        }
+        let out_b = &mut out[b * T * OC..b * T * OC + T * OC];
+        let inp_b = &inp[b * T * C..b * T * C + T * C];
+        // compute each row of the output
+        out_b
+            .par_chunks_mut(OC)
+            .zip(inp_b.par_chunks(C))
+            .take(T)
+            .for_each(|(row, inp_bt)| {
+                row.iter_mut().enumerate().for_each(|(o, val)| {
+                    let mut sum = if let Some(bias) = bias { bias[o] } else { 0.0 };
+                    let wrow = &weight[o * C..(o + 1) * C];
+                    for i in 0..C {
+                        sum += inp_bt[i] * wrow[i];
+                    }
+                    *val = sum;
+                });
+            })
     }
 }
 
@@ -557,35 +567,58 @@ pub fn matmul_backward(
 ) {
     // backward into inp first
     for b in 0..B {
-        for t in 0..T {
-            let dout_bt = &dout[b * T * OC + t * OC..b * T * OC + (t + 1) * OC];
-            let dinp_bt = &mut dinp[b * T * C + t * C..b * T * C + (t + 1) * C];
-            for o in 0..OC {
-                let wrow = &weight[o * C..(o + 1) * C];
-                let d = dout_bt[o];
-                for i in 0..C {
-                    dinp_bt[i] += wrow[i] * d;
-                }
-            }
-        }
+        let dout_b = &dout[b * T * OC..b * T * OC + T * OC];
+        let dinp_b = &mut dinp[b * T * C..b * T * C + T * C];
+        dout_b
+            .par_chunks(OC)
+            .zip(dinp_b.par_chunks_mut(C))
+            .take(T)
+            .for_each(|(dout_bt, dinp_bt)| {
+                dout_bt.iter().enumerate().for_each(|(o, d)| {
+                    let wrow = &weight[o * C..(o + 1) * C];
+                    for i in 0..C {
+                        dinp_bt[i] += wrow[i] * d;
+                    }
+                });
+            });
     }
 
-    // backward into weight and bias
-    for o in 0..OC {
-        for b in 0..B {
-            for t in 0..T {
-                let dout_bt = &dout[b * T * OC + t * OC..b * T * OC + (t + 1) * OC];
-                let inp_bt = &inp[b * T * C + t * C..b * T * C + (t + 1) * C];
-                let dwrow = &mut dweight[o * C..(o + 1) * C];
-                let d = dout_bt[o];
-                if let Some(&mut ref mut dbias) = dbias {
-                    dbias[o] += d;
+    if let Some(&mut ref mut dbias) = dbias {
+        dweight
+            .par_chunks_mut(C)
+            .zip(dbias.par_iter_mut())
+            .take(OC)
+            .enumerate()
+            .for_each(|(o, (dwrow, dbias_o))| {
+                for b in 0..B {
+                    for t in 0..T {
+                        let dout_bt = &dout[b * T * OC + t * OC..b * T * OC + (t + 1) * OC];
+                        let inp_bt = &inp[b * T * C + t * C..b * T * C + (t + 1) * C];
+                        let d = dout_bt[o];
+                        *dbias_o += d;
+                        for i in 0..C {
+                            dwrow[i] += inp_bt[i] * d;
+                        }
+                    }
                 }
-                for i in 0..C {
-                    dwrow[i] += inp_bt[i] * d;
+            })
+    } else {
+        dweight
+            .par_chunks_mut(C)
+            .take(OC)
+            .enumerate()
+            .for_each(|(o, dwrow)| {
+                for b in 0..B {
+                    for t in 0..T {
+                        let dout_bt = &dout[b * T * OC + t * OC..b * T * OC + (t + 1) * OC];
+                        let inp_bt = &inp[b * T * C + t * C..b * T * C + (t + 1) * C];
+                        let d = dout_bt[o];
+                        for i in 0..C {
+                            dwrow[i] += inp_bt[i] * d;
+                        }
+                    }
                 }
-            }
-        }
+            });
     }
 }
 
@@ -602,7 +635,7 @@ pub fn attention_forward(
     let C3 = C * 3;
     let hs = C / NH; // head size
     let scale = 1.0 / (hs as f32).sqrt();
-
+    // TODO: parallelize this
     for b in 0..B {
         for t in 0..T {
             for h in 0..NH {
