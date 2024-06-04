@@ -27,8 +27,7 @@ python scripts/train_gpt2.py
 Then just build and run with cargo:
 
 ```bash
-cargo build --release
-./target/release/llm
+cargo run --release
 ```
 
 The rayon is used for parallelism, currently only matmul is parallelized and the attention layer is
