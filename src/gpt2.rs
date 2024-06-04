@@ -1,7 +1,10 @@
 use std::{f32::consts::PI, io::Read};
 
 use rayon::{
-    iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator},
+    iter::{
+        IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator,
+        ParallelIterator,
+    },
     slice::{ParallelSlice, ParallelSliceMut},
 };
 
@@ -410,25 +413,29 @@ pub fn layernorm_forward(
     C: usize,
 ) {
     let eps = 1e-5f32;
-    for b in 0..B {
-        for t in 0..T {
-            let x = &inp[b * T * C + t * C..b * T * C + (t + 1) * C];
-            let m = x.iter().take(C).sum::<f32>() / C as f32;
-            let v = x.iter().take(C).map(|xi| (xi - m) * (xi - m)).sum::<f32>() / C as f32;
+    inp.par_chunks(T * C)
+        .zip(out.par_chunks_mut(T * C))
+        .zip(mean.par_chunks_mut(T))
+        .zip(rstd.par_chunks_mut(T))
+        .take(B)
+        .for_each(|(((inp_b, out_b), mean_b), rstd_b)| {
+            for t in 0..T {
+                let x = &inp_b[t * C..(t + 1) * C];
+                let m = x.iter().sum::<f32>() / C as f32;
+                let v = x.iter().map(|xi| (xi - m) * (xi - m)).sum::<f32>() / C as f32;
+                let s = 1.0f32 / (v + eps).sqrt();
 
-            let s = 1.0f32 / (v + eps).sqrt();
+                let out_bt = &mut out_b[t * C..(t + 1) * C];
+                for i in 0..C {
+                    let n = s * (x[i] - m);
+                    let o = n * weight[i] + bias[i];
+                    out_bt[i] = o;
+                }
 
-            let out_bt = &mut out[b * T * C + t * C..b * T * C + (t + 1) * C];
-            for i in 0..C {
-                let n = s * (x[i] - m);
-                let o = n * weight[i] + bias[i];
-                out_bt[i] = o;
+                mean_b[t] = m;
+                rstd_b[t] = s;
             }
-
-            mean[b * T + t] = m;
-            rstd[b * T + t] = s;
-        }
-    }
+        });
 }
 
 pub fn layernorm_backward(
@@ -488,13 +495,14 @@ pub fn crossentropy_forward(
     T: usize,
     Vp: usize,
 ) {
-    for b in 0..B {
-        for t in 0..T {
-            let probs_bt = &probs[b * T * Vp + t * Vp..b * T * Vp + (t + 1) * Vp];
-            let ix = targets[b * T + t] as usize;
-            losses[b * T + t] = -probs_bt[ix].ln();
-        }
-    }
+    losses
+        .par_iter_mut()
+        .zip(probs.par_chunks(Vp))
+        .zip(targets.par_iter())
+        .take(B * T)
+        .for_each(|((loss, probs_bt), &ix)| {
+            *loss = -probs_bt[ix as usize].ln();
+        });
 }
 
 pub fn crossentropy_softmax_backward(
@@ -507,19 +515,19 @@ pub fn crossentropy_softmax_backward(
     V: usize,
     Vp: usize,
 ) {
-    for b in 0..B {
-        for t in 0..T {
-            let dlogits_bt = &mut dlogits[b * T * Vp + t * Vp..b * T * Vp + (t + 1) * Vp];
-            let probs_bt = &probs[b * T * Vp + t * Vp..b * T * Vp + (t + 1) * Vp];
-            let dloss = dlosses[b * T + t];
-            let ix = targets[b * T + t] as usize;
+    dlogits
+        .par_chunks_mut(Vp)
+        .zip(probs.par_chunks(Vp))
+        .zip(dlosses.par_iter())
+        .zip(targets.par_iter())
+        .take(B * T)
+        .for_each(|(((dlogits_bt, probs_bt), &dloss), &ix)| {
             for i in 0..V {
                 let p = probs_bt[i];
-                let indicator = if i == ix { 1.0 } else { 0.0 };
+                let indicator = if i == ix as usize { 1.0 } else { 0.0 };
                 dlogits_bt[i] += (p - indicator) * dloss;
             }
-        }
-    }
+        });
 }
 
 pub fn matmul_forward(
@@ -764,8 +772,8 @@ pub fn attention_backward(
 
 pub fn gelu_forward(out: &mut [f32], inp: &[f32], N: usize) {
     let GELU_SCALING_FACTOR: f32 = (2.0 / PI).sqrt();
-    out.iter_mut()
-        .zip(inp.iter())
+    out.par_iter_mut()
+        .zip(inp.par_iter())
         .take(N)
         .for_each(|(out_i, &inp_i)| {
             let x = inp_i;
@@ -776,8 +784,8 @@ pub fn gelu_forward(out: &mut [f32], inp: &[f32], N: usize) {
 
 pub fn gelu_backward(dinp: &mut [f32], inp: &[f32], dout: &[f32], N: usize) {
     let GELU_SCALING_FACTOR: f32 = (2.0 / PI).sqrt();
-    dinp.iter_mut()
-        .zip(inp.iter().zip(dout.iter()))
+    dinp.par_iter_mut()
+        .zip(inp.par_iter().zip(dout.par_iter()))
         .take(N)
         .for_each(|(dinp_i, (x, dout_i))| {
             let cube = 0.044715 * x * x * x;
@@ -792,8 +800,8 @@ pub fn gelu_backward(dinp: &mut [f32], inp: &[f32], dout: &[f32], N: usize) {
 }
 
 pub fn residual_forward(out: &mut [f32], inp1: &[f32], inp2: &[f32], N: usize) {
-    out.iter_mut()
-        .zip(inp1.iter().zip(inp2.iter()))
+    out.par_iter_mut()
+        .zip(inp1.par_iter().zip(inp2.par_iter()))
         .take(N)
         .for_each(|(out_i, (&inp1_i, &inp2_i))| {
             *out_i = inp1_i + inp2_i;
@@ -801,8 +809,8 @@ pub fn residual_forward(out: &mut [f32], inp1: &[f32], inp2: &[f32], N: usize) {
 }
 
 pub fn residual_backward(dinp1: &mut [f32], dinp2: &mut [f32], dout: &[f32], N: usize) {
-    dout.iter()
-        .zip(dinp1.iter_mut().zip(dinp2.iter_mut()))
+    dout.par_iter()
+        .zip(dinp1.par_iter_mut().zip(dinp2.par_iter_mut()))
         .take(N)
         .for_each(|(&dout_i, (dinp1_i, dinp2_i))| {
             *dinp1_i += dout_i;
